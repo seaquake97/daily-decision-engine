@@ -7,10 +7,15 @@ S1量能/S2宽度/S3动量/S4分化/S5资金/S6估值 → Σ → 四档评级。
 
 用法:
     python3 compute_signals.py <market_data.json> [--kline sh000001_kline.json] [-o out.json]
+                              [--rsi 55.0] [--bias 0.03] [--strong-trend]
 
 market_data.json 可选增强字段（有则参与计算，无则标注数据缺口并降权）:
     kline_close: [近30日收盘价...]           # 来自 data_kline
     sector_flows: {"top_inflow": 亿元, "top_outflow": 亿元}
+
+可选技术面入参（S4 动量确认，缺省则 S4 维持纯分化，分项映射见 signal_momentum.py）:
+    --rsi 55.0 / --bias 0.03 / --strong-trend
+    复合公式：s4 = clamp(0.6 * 分化项 + 0.4 * 动量项)
 
 设计原则（v1.1 修复记录）:
     - S1 用 volume_ratio（量比，已按同时段归一化）而非"半日成交额/全日均值"
@@ -18,10 +23,26 @@ market_data.json 可选增强字段（有则参与计算，无则标注数据缺
     - S2 宽度项权重 0.7 / 涨跌停项 0.3（原 0.7/0.3 中涨停项 /30 过敏感，改 /50）
     - v1.2: 有效权重 < MIN_DIRECTIONAL_WEIGHT（过半信号缺失）时评级封顶为"信号矛盾"，
       防止单一信号（如仅宽度 S2）主导出方向性结论；verdict 增加 data_insufficient 标记
+    - v1.3: S4 保守增强为「分化 + 动量确认」复合信号（见 s4_divergence 文档串）。
+      向后兼容铁律：不传 --rsi/--bias 时 S4 与 v1.2 逐字节一致（纯分化，权重/说明不变）。
 """
 import argparse
 import json
 import sys
+from pathlib import Path
+
+# A-04：本脚本位于 <project>/_git_engine/scripts，同目录模块与 framework 均相对推导，不写死绝对路径
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+try:
+    import signal_momentum as _momentum
+
+    _MOMENTUM_IMPORT_ERROR = None
+except Exception as _e:  # 载入失败不阻断默认路径（纯分化），仅在显式启用动量时报错退出
+    _momentum = None
+    _MOMENTUM_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
 
 WEIGHTS = {"S1": 0.20, "S2": 0.20, "S3": 0.15, "S4": 0.15, "S5": 0.15, "S6": 0.15}
 
@@ -102,8 +123,17 @@ def s3_momentum(idx, kline_close_sorted, today_str):
     return round(s, 3), "，".join(parts)
 
 
-def s4_divergence(idx):
-    """分化：成长（创业板+科创50）vs 蓝筹（沪深300）。"""
+def s4_divergence(idx, rsi=None, bias=None, strong_trend=False):
+    """分化：成长（创业板+科创50）vs 蓝筹（沪深300）。
+
+    v1.3 保守增强：提供技术面入参（--rsi / --bias / --strong-trend）时，
+    升级为「分化 + 动量确认」复合信号：
+        s4 = clamp(0.6 * 分化项 + 0.4 * 动量项)
+    动量项由 signal_momentum.evaluate() 计算（Wilder RSI 超买超卖 + 动态 BIAS 强势补偿）。
+
+    向后兼容铁律：rsi 与 bias 均为 None 时，返回值与说明文案与 v1.2 完全一致（纯分化）。
+    数据缺口优先：指数缺失时无论是否提供技术面入参，一律返回 None + 缺口提示。
+    """
     cy = num((idx.get("sz399006") or {}).get("change_percent"))
     kc = num((idx.get("sh000688") or {}).get("change_percent"))
     hs = num((idx.get("sh000300") or {}).get("change_percent"))
@@ -111,7 +141,25 @@ def s4_divergence(idx):
         return None, "数据缺口：成长/蓝筹指数缺失"
     spread = (cy + kc) / 2 - hs
     s = clamp(spread / 2.0)
-    return round(s, 3), f"成长均值 {(cy+kc)/2:+.2f}% vs 沪深300 {hs:+.2f}%，价差 {spread:+.2f}pct"
+    note = f"成长均值 {(cy+kc)/2:+.2f}% vs 沪深300 {hs:+.2f}%，价差 {spread:+.2f}pct"
+
+    momentum = None
+    if rsi is not None or bias is not None:
+        if _momentum is None:  # 显式启用但模块不可用：报错，禁止静默降级回纯分化
+            raise RuntimeError(f"S4 动量确认不可用：{momentum_unavailable_reason()}")
+        momentum = _momentum.evaluate(rsi=rsi, bias=bias, strong_trend=strong_trend)
+    if momentum is None:
+        return round(s, 3), note
+
+    s = clamp(_momentum.S4_DIVERGENCE_WEIGHT * s + _momentum.S4_MOMENTUM_WEIGHT * momentum.score)
+    return round(s, 3), f"{note}；{momentum.note}"
+
+
+def momentum_unavailable_reason() -> "str | None":
+    """动量确认不可用的原因（None = 可用）。用于显式启用时先做前置校验，禁止静默降级。"""
+    if _momentum is None:
+        return f"动量模块 signal_momentum.py 未载入（{_MOMENTUM_IMPORT_ERROR}）"
+    return _momentum.unavailable_reason()
 
 
 def s5_funds_flow(sector):
@@ -162,8 +210,34 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("path")
     ap.add_argument("--kline", default=None, help="sh000001 日K JSON（data_kline 输出，兼容升/降序）")
+    ap.add_argument("--rsi", type=float, default=None,
+                    help="Wilder RSI（0~100）；>70 超买 -0.3，<30 超卖 +0.3，启用 S4 动量确认")
+    ap.add_argument("--bias", type=float, default=None,
+                    help="乖离率（0.03 = +3%%）；由 technical.calculate_bias 判定 status，启用 S4 动量确认")
+    ap.add_argument("--strong-trend", action="store_true",
+                    help="强势趋势开关：BIAS 阈值放宽 1.5 倍，需配合 --bias 生效")
     ap.add_argument("-o", "--output", default=None)
     args = ap.parse_args()
+
+    # 技术面入参合法性：非法值直接失败退出，禁止静默截断或按默认值继续算
+    if args.rsi is not None and not (0.0 <= args.rsi <= 100.0):
+        print(f"⛔ --rsi 非法：{args.rsi}（RSI 取值应在 0~100）")
+        sys.exit(2)
+    if args.bias is not None and args.bias <= -1.0:
+        print(f"⛔ --bias 非法：{args.bias}（乖离率必须 > -1.0，否则反推现价非正）")
+        sys.exit(2)
+
+    momentum_requested = args.rsi is not None or args.bias is not None
+    if momentum_requested:
+        reason = momentum_unavailable_reason()
+        if reason:
+            print(f"⛔ S4 动量确认不可用：{reason}")
+            print("   （不传 --rsi/--bias 时 S4 走纯分化，不依赖技术指标库）")
+            sys.exit(2)
+        if args.strong_trend and args.bias is None:
+            print("⚠️ --strong-trend 需配合 --bias 生效：本次未提供 --bias，S4 走纯分化")
+    elif args.strong_trend:
+        print("⚠️ --strong-trend 需配合 --bias 生效：本次未提供 --rsi/--bias，S4 走纯分化")
 
     with open(args.path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -215,7 +289,8 @@ def main():
     signals["S1"], notes["S1"] = s1_volume(idx, num(data.get("total_amount_yi")))
     signals["S2"], notes["S2"] = s2_breadth(mb)
     signals["S3"], notes["S3"] = s3_momentum(idx, kline_close_sorted, str(data.get("date", "")))
-    signals["S4"], notes["S4"] = s4_divergence(idx)
+    signals["S4"], notes["S4"] = s4_divergence(idx, rsi=args.rsi, bias=args.bias,
+                                               strong_trend=args.strong_trend)
     signals["S5"], notes["S5"] = s5_funds_flow(sector)
     signals["S6"], notes["S6"] = s6_valuation(idx)
 
@@ -234,6 +309,22 @@ def main():
         "notes": notes,
         "degraded": [k for k, v in signals.items() if v is None],
     }
+
+    # 仅在显式启用动量时追加可审计元数据；纯分化模式下 verdict 结构与 v1.2 完全一致
+    if momentum_requested:
+        mr = _momentum.evaluate(rsi=args.rsi, bias=args.bias, strong_trend=args.strong_trend)
+        if mr is not None:
+            verdict["s4_technical"] = {
+                "rsi": args.rsi,
+                "bias": args.bias,
+                "strong_trend": args.strong_trend,
+                "bias_status": mr.bias_status,
+                "bias_score": mr.bias_score,
+                "rsi_score": mr.rsi_score,
+                "momentum": mr.score,
+                "divergence_weight": _momentum.S4_DIVERGENCE_WEIGHT,
+                "momentum_weight": _momentum.S4_MOMENTUM_WEIGHT,
+            }
 
     print("=== 信号评分（代码计算，LLM 禁改） ===")
     for k in ["S1", "S2", "S3", "S4", "S5", "S6"]:

@@ -35,7 +35,7 @@ Trading-day check → MCP fetch → Signal scoring → Holdings parse → Hard v
 | S1 量能 | 0.20 | 指数量比（同时段归一化） | Volume | 0.20 | Volume ratio vs. same-period baseline |
 | S2 宽度 | 0.20 | 上涨占比 + 涨跌停结构 | Breadth | 0.20 | Advance ratio + limit-up/down structure |
 | S3 动量 | 0.15 | 价格/MA5、价格/MA20、20日涨跌 | Momentum | 0.15 | Price vs MA5/MA20, 20-day change |
-| S4 分化 | 0.15 | 成长指数 vs 蓝筹指数价差 | Dispersion | 0.15 | Growth vs. blue-chip spread |
+| S4 分化+动量确认 | 0.15 | 成长指数 vs 蓝筹指数价差 + 可选 RSI/BIAS 动量 | Divergence + Momentum Confirmation | 0.15 | Growth vs. blue-chip spread + optional RSI/BIAS momentum |
 | S5 资金 | 0.15 | 主力净流入极值差 | Fund flow | 0.15 | Net inflow extremes |
 | S6 估值 | 0.15 | 指数 PE + 60日回撤 | Valuation | 0.15 | Index PE + 60-day drawdown |
 

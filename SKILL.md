@@ -6,7 +6,7 @@ description: >-
   基金操作指引、股票助手等定时研判任务时必须加载本技能。触发词：每日决策引擎、
   每日复盘决策、基金每日操作、研判协议、决策卡、观点台账、信号评分。
 agent_created: true
-version: 1.0.0
+version: 1.4.0
 display_name: "每日决策引擎"
 display_name_en: "Daily Decision Engine"
 description_zh: "基金股票每日研判的决策引擎：数据校验、信号评分、决策卡、观点台账与专家辩论协议。"
@@ -81,7 +81,12 @@ LLM 直接写 JSON，历史日期脚本是脏数据源头。
 
 ```bash
 python3 scripts/compute_signals.py <market_data.json路径> [--kline <sh000001 kline json>]
+                                   [--rsi <float>] [--bias <float>] [--strong-trend]
 ```
+
+S4 技术面入参三者均可选：`--rsi`（Wilder RSI，0~100）、`--bias`（乖离率，0.03 = +3%）、
+`--strong-trend`（BIAS 阈值放宽 1.5 倍，需配合 `--bias`）。**不传则走纯分化，与 v1.2 一致**；
+传入后 `s4 = clamp(0.6 * 分化项 + 0.4 * 动量项)`。
 
 六个确定性信号（细则见 `references/signal-scoring.md`）：
 
@@ -90,9 +95,12 @@ python3 scripts/compute_signals.py <market_data.json路径> [--kline <sh000001 k
 | S1 量能 | 0.20 | 沪指量比 volume_ratio（同时段归一化） | 放量+缩量- |
 | S2 宽度 | 0.20 | 上涨占比、涨停-跌停差 | 正 |
 | S3 动量 | 0.15 | 上证 vs MA5/MA20、20日涨跌 | 正 |
-| S4 分化 | 0.15 | 创业板+科创50 均值 - 沪深300 | 正 |
+| S4 分化+动量确认 | 0.15 | 创业板+科创50 均值 - 沪深300 + 可选 RSI/BIAS 动量 | 正 |
 | S5 资金 | 0.15 | 板块主力净流入TOP1 - 净流出TOP1 | 正 |
 | S6 估值 | 0.15 | 沪深300 PE + 60日涨跌代理 | 低估值正 |
+
+S4 动量确认为 opt-in：不传 `--rsi`/`--bias` 时走纯分化分支，与 v1.2 输出一致；
+启用后 `s4 = clamp(0.6 * 分化项 + 0.4 * 动量项)`（细则见 `references/signal-scoring.md`）。
 
 Σ∈[-1,1]，评级：**Σ≥0.50 进攻 / 0.15~0.50 均衡 / -0.50~-0.15 防守 /
 Σ≤-0.50 回避**；|Σ|<0.15 或有效权重<0.50 为"信号矛盾"（暂停主动买入；可挂低于现价
